@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# mouse-doctor — find the keybinding combos that actually work on THIS machine,
+# then write them into the keymap and into gsettings.
+#
+# Why: on some systems injected combos never reach the compositor (a remapper
+# such as keyd can swallow Ctrl, layouts can change letter keysyms). Instead of
+# guessing, this binds a real shell action that leaves a file behind
+# (org.gnome.shell.keybindings screenshot), injects the candidate combo, and
+# counts new files. Pass/fail per combo, no eyeballing.
+#
+# Usage:
+#   mouse-doctor                     probe, then write keymap + gsettings
+#   mouse-doctor --dry-run           probe and print only, change nothing
+#   mouse-doctor --mods Shift+Alt    skip probing, use this modifier set
+#   mouse-doctor --help
+
+set -u
+
+DRY_RUN=0
+FORCED_MODS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1 ;;
+        --mods) shift; FORCED_MODS="${1:-}" ;;
+        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mouse-gestures"
+CONF="$CONF_DIR/keymap.conf"
+KB=org.gnome.shell.keybindings
+WM=org.gnome.desktop.wm.keybindings
+MK=org.gnome.settings-daemon.plugins.media-keys
+SHOTS="$(xdg-user-dir PICTURES 2>/dev/null || echo "$HOME/Pictures")/Screenshots"
+PROBE_TMP="${XDG_RUNTIME_DIR:-/tmp}/mouse-doctor-probes"
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  [ok]   %s\n' "$*"; }
+bad()  { printf '  [fail] %s\n' "$*"; }
+warn() { printf '  [warn] %s\n' "$*"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || { bad "missing tool: $1"; exit 1; }; }
+
+# ---------------------------------------------------------------- preflight --
+say "mouse-doctor"
+say "-----------"
+[ "${XDG_SESSION_TYPE:-}" = wayland ] || warn "session is not Wayland (${XDG_SESSION_TYPE:-unknown}) — this project targets GNOME Wayland"
+case "${XDG_CURRENT_DESKTOP:-}" in
+    *GNOME*) ok "GNOME session detected" ;;
+    *) warn "desktop is '${XDG_CURRENT_DESKTOP:-unknown}', GNOME expected — gsettings targets below are GNOME's" ;;
+esac
+need ydotool
+ok "ydotool found"
+if [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket" ]; then
+    ok "ydotoold socket present"
+else
+    bad "ydotoold socket missing — run: systemctl --user enable --now ydotool.service"; exit 1
+fi
+if systemctl is-active --quiet keyd 2>/dev/null; then
+    warn "keyd is running — remappers in the input stack can swallow injected modifiers (commonly Ctrl)"
+fi
+mkdir -p "$SHOTS" "$PROBE_TMP" 2>/dev/null
+
+# ------------------------------------------------------------- state guards --
+saved_shots=$(gsettings get "$KB" screenshot 2>/dev/null || echo "['<Shift>Print']")
+saved_sr=$(gsettings get "$MK" screenreader 2>/dev/null || echo "@as []")
+saved_ov=$(gsettings get "$KB" toggle-overview 2>/dev/null || echo "@as []")
+saved_sd=$(gsettings get "$WM" show-desktop 2>/dev/null || echo "@as []")
+saved_wl=$(gsettings get "$WM" switch-to-workspace-left 2>/dev/null || echo "@as []")
+saved_wr=$(gsettings get "$WM" switch-to-workspace-right 2>/dev/null || echo "@as []")
+
+APPLIED=0
+PROBE_START=$(date +%s)
+
+restore_state() {
+    gsettings set "$KB" screenshot "$saved_shots" 2>/dev/null
+    gsettings set "$MK" screenreader "$saved_sr" 2>/dev/null
+    if [ "$APPLIED" != 1 ]; then
+        gsettings set "$KB" toggle-overview "$saved_ov" 2>/dev/null
+        gsettings set "$WM" show-desktop "$saved_sd" 2>/dev/null
+        gsettings set "$WM" switch-to-workspace-left "$saved_wl" 2>/dev/null
+        gsettings set "$WM" switch-to-workspace-right "$saved_wr" 2>/dev/null
+    fi
+    # move probe screenshots out of the user's Pictures folder
+    find "$SHOTS" -maxdepth 1 -name '*.png' -newermt "@$PROBE_START" -exec mv -t "$PROBE_TMP" {} + 2>/dev/null
+}
+trap restore_state EXIT INT TERM
+
+# Probing needs the action combos free: a binding that already owns the combo
+# wins the grab, and the screenshot probe then reports a false "no".
+gsettings set "$KB" toggle-overview "@as []" 2>/dev/null
+for key in show-desktop switch-to-workspace-left switch-to-workspace-right; do
+    gsettings set "$WM" "$key" "@as []" 2>/dev/null
+done
+# Injected Alt+Super+S (or a stuck Super) turns Orca on. Empty that shortcut
+# while probing, restore on exit.
+gsettings set "$MK" screenreader "@as []" 2>/dev/null
+
+shot_count() { ls -1 "$SHOTS" 2>/dev/null | wc -l; }
+
+# combo name -> ydotool key sequence (keys are layout-independent on purpose)
+seq_for() {  # $1 = "Shift+Alt+Home"
+    local spec="$1" key mods m codes="" order="" kc mc
+    key="${spec##*+}"
+    mods=""; [ "$key" = "$spec" ] || mods="${spec%+*}"
+    case "$key" in
+        Home) kc=102 ;; End) kc=107 ;; Left) kc=105 ;; Right) kc=106 ;;
+        Up) kc=103 ;; Down) kc=108 ;; Page_Up) kc=104 ;; Page_Down) kc=109 ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$mods" ]; then
+        IFS='+' read -r -a list <<< "$mods"
+        for m in "${list[@]}"; do
+            case "$m" in Shift) mc=42 ;; Alt) mc=56 ;; Ctrl) mc=29 ;; Super) mc=125 ;; *) return 1 ;; esac
+            codes="$codes $mc:1"; order="$mc $order"
+        done
+    fi
+    local s="$codes $kc:1 $kc:0"
+    for mc in $order; do s="$s $mc:0"; done
+    printf '%s' "$s"
+}
+
+# combo name -> GTK accelerator: "Shift+Alt+Home" -> "<Shift><Alt>Home"
+accel_for() {
+    local spec="$1" key mods out="" m
+    key="${spec##*+}"; mods=""; [ "$key" = "$spec" ] || mods="${spec%+*}"
+    if [ -n "$mods" ]; then
+        IFS='+' read -r -a list <<< "$mods"
+        for m in "${list[@]}"; do out="${out}<${m}>"; done
+    fi
+    printf '%s%s' "$out" "$key"
+}
+
+# probe_combo "Shift+Alt+Home" -> 0 fired, 1 did not
+probe_combo() {
+    local spec="$1" before after s accel i attempt
+    s=$(seq_for "$spec") || return 1
+    accel=$(accel_for "$spec")
+    for attempt in 1 2; do                    # one retry: the first injection after a
+        gsettings set "$KB" screenshot "['${accel}']" 2>/dev/null || return 1
+        sleep 1.5                             # settings write can be swallowed
+        before=$(shot_count)
+        # shellcheck disable=SC2086
+        ydotool key -d 100 $s >/dev/null 2>&1
+        for i in $(seq 1 20); do              # poll up to 6 s for the PNG
+            sleep 0.3
+            after=$(shot_count)
+            [ "$after" -gt "$before" ] && break
+        done
+        gsettings set "$KB" screenshot "$saved_shots" 2>/dev/null
+        [ "$after" -gt "$before" ] && return 0
+    done
+    return 1
+}
+
+# ------------------------------------------------------------------ probing --
+CANDIDATE_MODS=("Shift+Alt" "Shift" "Ctrl+Alt" "Ctrl" "Super+Alt")
+ACTION_KEYS=("overview:Home" "showdesk:End" "ws_prev:Left" "ws_next:Right")
+declare -A COMBO
+
+verify_all() {  # $1 = modifier set -> fills COMBO, 0 if all four fired
+    local mods="$1" pair a k failed=0
+    COMBO=()
+    for pair in "${ACTION_KEYS[@]}"; do
+        a="${pair%%:*}"; k="${pair##*:}"
+        if probe_combo "${mods}+${k}"; then
+            ok "$a = ${mods}+${k}"; COMBO[$a]="${mods}+${k}"
+        else
+            bad "$a = ${mods}+${k}"; failed=1
+        fi
+    done
+    [ "$failed" = 0 ]
+}
+
+chosen=""
+if [ -n "$FORCED_MODS" ]; then
+    say ""
+    say "verifying forced modifier set: $FORCED_MODS"
+    verify_all "$FORCED_MODS" && chosen="$FORCED_MODS"
+else
+    say ""
+    say "probing modifier sets (screen on Home, then verify all four actions):"
+    for m in "${CANDIDATE_MODS[@]}"; do
+        printf '  %-10s ' "$m"
+        if probe_combo "${m}+Home"; then
+            printf 'fires — verifying\n'
+            verify_all "$m" && { chosen="$m"; break; }
+        else
+            printf 'no\n'
+        fi
+    done
+fi
+
+[ -n "$chosen" ] || { say ""; bad "no modifier set passed all four combos"; exit 1; }
+say ""
+ok "using $chosen"
+case "$chosen" in
+    Shift) warn "Shift alone is a text-selection modifier (Shift+Home selects to line start) — Shift+Alt is nicer when it works" ;;
+    Ctrl*) warn "Ctrl combos get swallowed by remappers such as keyd — re-run this after changing such tools" ;;
+esac
+
+# ------------------------------------------------------------------- writing --
+say ""
+if [ "$DRY_RUN" = 1 ]; then
+    say "dry run — would write $CONF with:"
+    for a in overview showdesk ws_prev ws_next; do printf '  %-9s = %s\n' "$a" "${COMBO[$a]}"; done
+    exit 0
+fi
+
+mkdir -p "$CONF_DIR"
+cat > "$CONF" <<EOF
+# mouse-gestures keymap — written by mouse-doctor
+# action = <Modifiers>+<Key>   |   action = cmd:<shell command>
+# Keys must be layout-independent (arrows, Home/End, F-keys). Never letters:
+# a second keyboard layout (e.g. Greek) changes their keysyms.
+overview  = ${COMBO[overview]}
+showdesk  = ${COMBO[showdesk]}
+ws_prev   = ${COMBO[ws_prev]}
+ws_next   = ${COMBO[ws_next]}
+EOF
+
+# command-based actions: no injection, so they always work
+if command -v vicinae >/dev/null 2>&1; then
+    printf 'appgrid   = cmd:vicinae toggle\n' >> "$CONF"
+    ok "appgrid via vicinae"
+fi
+if command -v hermes >/dev/null 2>&1; then
+    printf 'hermes    = cmd:hermes desktop\n' >> "$CONF"
+fi
+
+apply_binding() {  # $1 schema, $2 key, $3 accelerator, $4 base value, $5 "keep" to append to base
+    local schema="$1" key="$2" accel="$3" base="$4" mode="${5:-replace}"
+    if [ "$mode" = keep ] && [ -n "$base" ] && [ "$base" != "@as []" ]; then
+        if printf '%s' "$base" | grep -q -- "$accel"; then
+            ok "$key already has $accel"
+            return
+        fi
+        gsettings set "$schema" "$key" "${base%]}, '${accel}']"
+    else
+        gsettings set "$schema" "$key" "['${accel}']"
+    fi
+    ok "$key = $accel"
+}
+
+say ""
+say "binding desktop actions:"
+apply_binding "$KB" toggle-overview "$(accel_for "${COMBO[overview]}")" "$saved_ov"
+apply_binding "$WM" show-desktop "$(accel_for "${COMBO[showdesk]}")" "$saved_sd"
+apply_binding "$WM" switch-to-workspace-left "$(accel_for "${COMBO[ws_prev]}")" "$saved_wl" keep
+apply_binding "$WM" switch-to-workspace-right "$(accel_for "${COMBO[ws_next]}")" "$saved_wr" keep
+APPLIED=1
+
+say ""
+say "written: $CONF"
+say "test with your hands: gesture tap = overview, swipe down = show desktop, swipe left/right = desktops"

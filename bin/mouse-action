@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# mouse-action — run one desktop action, debounced.
+#
+# Two things it fixes:
+#   * Logitech mice (MX Master 4 and friends) emit every physical press TWICE,
+#     so toggle actions open and instantly close. Identical actions inside
+#     $MOUSE_GESTURES_DEBOUNCE ms are dropped.
+#   * All key mechanics live in a keymap file, so `mouse-doctor` can swap the
+#     trigger combos for the ones that actually work on this machine.
+#
+# Usage: mouse-action <action>
+#   keymap: ~/.config/mouse-gestures/keymap.conf   (created by install.sh / mouse-doctor)
+
+set -u
+
+action="${1:-}"
+[ -n "$action" ] || { echo "usage: mouse-action <action>" >&2; exit 1; }
+
+CONF="${MOUSE_GESTURES_CONF:-$HOME/.config/mouse-gestures/keymap.conf}"
+DEBOUNCE_MS="${MOUSE_GESTURES_DEBOUNCE:-600}"
+LOG="${XDG_RUNTIME_DIR:-/tmp}/mouse-action.log"
+YDOTOOL="${MOUSE_GESTURES_YDOTOOL:-$(command -v ydotool || echo /usr/bin/ydotool)}"
+
+# --- debounce ---------------------------------------------------------------
+state_dir="${XDG_RUNTIME_DIR:-/tmp}/mouse-action"
+mkdir -p "$state_dir" 2>/dev/null
+stamp="$state_dir/$action"
+now=$(date +%s%N)
+if [ -f "$stamp" ]; then
+    last=$(cat "$stamp" 2>/dev/null || echo 0)
+    if [ "${last:-0}" -gt 0 ] 2>/dev/null &&
+       [ $(( (now - last) / 1000000 )) -lt "$DEBOUNCE_MS" ]; then
+        exit 0
+    fi
+fi
+printf '%s' "$now" > "$stamp"
+
+# --- keymap lookup ----------------------------------------------------------
+[ -r "$CONF" ] || { echo "mouse-action: no keymap at $CONF (run install.sh)" >&2; exit 2; }
+line=$(grep -E "^[[:space:]]*${action}[[:space:]]*=" "$CONF" 2>/dev/null | tail -1)
+[ -n "$line" ] || { echo "mouse-action: action '$action' not in $CONF" >&2; exit 2; }
+spec=$(printf '%s' "${line#*=}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+[ -n "$spec" ] || { echo "mouse-action: empty spec for '$action'" >&2; exit 2; }
+
+log() { [ "${MOUSE_GESTURES_DEBUG:-0}" = 1 ] && printf '%s %s %s\n' "$(date -Is)" "$action" "$*" >> "$LOG"; return 0; }
+
+# --- command actions --------------------------------------------------------
+case "$spec" in
+    cmd:*)
+        cmd="${spec#cmd:}"
+        log "cmd -> $cmd"
+        sh -c "$cmd"
+        rc=$?
+        log "cmd rc=$rc"
+        exit $rc
+        ;;
+esac
+
+# --- key actions ------------------------------------------------------------
+# Keys are deliberately layout-independent: letters change keysym when a second
+# layout (e.g. Greek) is active, arrows/Home/End/F-keys never do.
+keycode() {
+    case "$1" in
+        Home) echo 102 ;; End) echo 107 ;;
+        Left) echo 105 ;; Right) echo 106 ;;
+        Up) echo 103 ;; Down) echo 108 ;;
+        Page_Up) echo 104 ;; Page_Down) echo 109 ;;
+        Insert) echo 110 ;; Delete) echo 111 ;;
+        Escape) echo 1 ;; Space) echo 57 ;; Print) echo 99 ;;
+        F1) echo 59 ;; F2) echo 60 ;; F3) echo 61 ;; F4) echo 62 ;;
+        F5) echo 63 ;; F6) echo 64 ;; F7) echo 65 ;; F8) echo 66 ;;
+        F9) echo 67 ;; F10) echo 68 ;; F11) echo 87 ;; F12) echo 88 ;;
+        *) return 1 ;;
+    esac
+}
+
+modcode() {
+    case "$1" in
+        Shift) echo 42 ;; Alt) echo 56 ;; Ctrl) echo 29 ;; Super) echo 125 ;;
+        *) return 1 ;;
+    esac
+}
+
+key="${spec##*+}"
+mods=""
+[ "$key" = "$spec" ] || mods="${spec%+*}"
+
+kc=$(keycode "$key") || { echo "mouse-action: unknown key '$key' in spec '$spec'" >&2; exit 2; }
+
+codes=""
+order=""
+if [ -n "$mods" ]; then
+    IFS='+' read -r -a list <<< "$mods"
+    for m in "${list[@]}"; do
+        mc=$(modcode "$m") || { echo "mouse-action: unknown modifier '$m'" >&2; exit 2; }
+        codes="$codes $mc:1"
+        order="$mc $order"          # release in reverse press order
+    done
+fi
+
+seq="$codes $kc:1 $kc:0"
+for mc in $order; do seq="$seq $mc:0"; done
+
+# shellcheck disable=SC2086
+"$YDOTOOL" key -d "${MOUSE_GESTURES_KEYDELAY:-60}" $seq
+rc=$?
+log "key $spec ->$seq rc=$rc"
+exit $rc
