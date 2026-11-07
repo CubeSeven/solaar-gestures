@@ -30,7 +30,7 @@ KDE Plasma support: not included. The previous KDE profile used `qdbus org.kde.k
 ## Install
 
 ```bash
-git clone https://github.com/<you>/solaar-gestures
+git clone https://github.com/CubeSeven/solaar-gestures
 cd solaar-gestures
 ./install.sh            # asks before writing anything
 ```
